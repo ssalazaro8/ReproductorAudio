@@ -21,7 +21,11 @@ static void sleep_ms(long ms)
     nanosleep(&ts, NULL);
 }
 
-static int open_alsa(snd_pcm_t **handle, uint16_t channels, uint32_t sample_rate)
+static int open_alsa(
+    snd_pcm_t **handle,
+    uint16_t channels,
+    uint32_t sample_rate
+)
 {
     int rc = snd_pcm_open(
         handle,
@@ -31,8 +35,11 @@ static int open_alsa(snd_pcm_t **handle, uint16_t channels, uint32_t sample_rate
     );
 
     if (rc < 0) {
-        fprintf(stderr, "[ALSA] No se pudo abrir el dispositivo: %s\n",
-                snd_strerror(rc));
+        fprintf(
+            stderr,
+            "[ALSA] No se pudo abrir el dispositivo: %s\n",
+            snd_strerror(rc)
+        );
         return -1;
     }
 
@@ -47,11 +54,15 @@ static int open_alsa(snd_pcm_t **handle, uint16_t channels, uint32_t sample_rate
     );
 
     if (rc < 0) {
-        fprintf(stderr, "[ALSA] No se pudo configurar audio: %s\n",
-                snd_strerror(rc));
+        fprintf(
+            stderr,
+            "[ALSA] No se pudo configurar audio: %s\n",
+            snd_strerror(rc)
+        );
 
         snd_pcm_close(*handle);
         *handle = NULL;
+
         return -1;
     }
 
@@ -61,7 +72,7 @@ static int open_alsa(snd_pcm_t **handle, uint16_t channels, uint32_t sample_rate
 static void close_alsa(snd_pcm_t **handle)
 {
     if (*handle) {
-        snd_pcm_drain(*handle);
+        snd_pcm_drop(*handle);
         snd_pcm_close(*handle);
         *handle = NULL;
     }
@@ -71,22 +82,54 @@ static int wait_until_playing(Player *player)
 {
     pthread_mutex_lock(&player->control_mutex);
 
-    while (!player->shutdown && player->state == PLAYER_PAUSED) {
+    while (
+        !player->shutdown &&
+        player->state != PLAYER_PLAYING
+    ) {
         pthread_cond_wait(
             &player->control_cond,
             &player->control_mutex
         );
     }
 
-    int ok = !player->shutdown &&
-             player->state == PLAYER_PLAYING;
+    int ok =
+        !player->shutdown &&
+        player->state == PLAYER_PLAYING;
 
     pthread_mutex_unlock(&player->control_mutex);
 
     return ok;
 }
 
-static int get_control_flags(Player *player, int *skip, int *previous)
+static int is_shutdown(Player *player)
+{
+    pthread_mutex_lock(&player->control_mutex);
+
+    int value = player->shutdown;
+
+    pthread_mutex_unlock(&player->control_mutex);
+
+    return value;
+}
+
+static void set_state(Player *player, PlayerState state)
+{
+    pthread_mutex_lock(&player->control_mutex);
+
+    player->state = state;
+
+    pthread_cond_broadcast(
+        &player->control_cond
+    );
+
+    pthread_mutex_unlock(&player->control_mutex);
+}
+
+static int get_control_flags(
+    Player *player,
+    int *skip,
+    int *previous
+)
 {
     pthread_mutex_lock(&player->control_mutex);
 
@@ -103,25 +146,53 @@ static int get_control_flags(Player *player, int *skip, int *previous)
     return shutdown;
 }
 
-static void set_state(Player *player, PlayerState state)
+static void set_audio_info(
+    Player *player,
+    uint32_t sample_rate,
+    uint16_t channels,
+    uint16_t bits
+)
 {
     pthread_mutex_lock(&player->control_mutex);
 
-    player->state = state;
-    pthread_cond_broadcast(&player->control_cond);
+    player->sample_rate = sample_rate;
+    player->channels = channels;
+    player->bits_per_sample = bits;
 
     pthread_mutex_unlock(&player->control_mutex);
 }
 
-static int is_shutdown(Player *player)
+static void get_audio_info(
+    Player *player,
+    uint32_t *sample_rate,
+    uint16_t *channels,
+    uint16_t *bits
+)
 {
     pthread_mutex_lock(&player->control_mutex);
 
-    int value = player->shutdown;
+    *sample_rate = player->sample_rate;
+    *channels = player->channels;
+    *bits = player->bits_per_sample;
 
     pthread_mutex_unlock(&player->control_mutex);
+}
 
-    return value;
+static void set_current_path(
+    Player *player,
+    const char *path
+)
+{
+    pthread_mutex_lock(&player->control_mutex);
+
+    snprintf(
+        player->current_path,
+        MAX_PATH,
+        "%s",
+        path
+    );
+
+    pthread_mutex_unlock(&player->control_mutex);
 }
 
 static void reset_buffer(Player *player)
@@ -135,48 +206,83 @@ static void *producer_main(void *arg)
     unsigned char data[IO_CHUNK];
 
     while (!is_shutdown(player)) {
+
         if (!wait_until_playing(player)) {
             break;
         }
 
         Track track;
 
-        if (playlist_current(player->playlist, &track) != 0) {
-            set_state(player, PLAYER_PAUSED);
+        if (playlist_current(
+                player->playlist,
+                &track
+            ) != 0) {
 
-            fprintf(stderr,
-                    "[Producer] Playlist vacía. Agrega una canción.\n");
+            set_state(
+                player,
+                PLAYER_PAUSED
+            );
 
-            sleep_ms(100);
+            fprintf(
+                stderr,
+                "[Producer] Playlist vacía. Agrega una canción.\n"
+            );
+
             continue;
         }
 
         WavFile wav;
 
         if (wav_open(&wav, track.path) != 0) {
-            fprintf(stderr,
-                    "[Producer] WAV no soportado o no encontrado: %s\n",
-                    track.path);
 
-            set_state(player, PLAYER_PAUSED);
+            fprintf(
+                stderr,
+                "[Producer] WAV no soportado o no encontrado: %s\n",
+                track.path
+            );
+
+            set_state(
+                player,
+                PLAYER_PAUSED
+            );
+
             continue;
         }
 
-        player->channels = wav.channels;
-        player->sample_rate = wav.sample_rate;
-        player->bits_per_sample = wav.bits_per_sample;
+        set_audio_info(
+            player,
+            wav.sample_rate,
+            wav.channels,
+            wav.bits_per_sample
+        );
 
-        snprintf(player->current_path, MAX_PATH, "%s", track.path);
+        set_current_path(
+            player,
+            track.path
+        );
 
-        fprintf(stderr, "\n[Producer] Cargando: %s\n", track.path);
-        fprintf(stderr, "[Producer] %u Hz | %u canales | %u bits\n",
-                wav.sample_rate,
-                wav.channels,
-                wav.bits_per_sample);
+        fprintf(
+            stderr,
+            "\n[Producer] Cargando: %s\n",
+            track.path
+        );
+
+        fprintf(
+            stderr,
+            "[Producer] %u Hz | %u canales | %u bits\n",
+            wav.sample_rate,
+            wav.channels,
+            wav.bits_per_sample
+        );
 
         int ended = 0;
+        int changed_track = 0;
 
-        while (!ended && !is_shutdown(player)) {
+        while (
+            !ended &&
+            !is_shutdown(player)
+        ) {
+
             if (!wait_until_playing(player)) {
                 break;
             }
@@ -184,11 +290,17 @@ static void *producer_main(void *arg)
             int skip = 0;
             int previous = 0;
 
-            get_control_flags(player, &skip, &previous);
+            if (get_control_flags(
+                    player,
+                    &skip,
+                    &previous
+                )) {
+                break;
+            }
 
             if (skip || previous) {
+
                 reset_buffer(player);
-                ended = 1;
 
                 if (previous) {
                     playlist_prev(player->playlist);
@@ -196,10 +308,17 @@ static void *producer_main(void *arg)
                     playlist_next(player->playlist);
                 }
 
+                changed_track = 1;
+                ended = 1;
+
                 break;
             }
 
-            size_t n = wav_read(&wav, data, sizeof(data));
+            size_t n = wav_read(
+                &wav,
+                data,
+                sizeof(data)
+            );
 
             if (n == 0) {
                 ended = 1;
@@ -223,15 +342,37 @@ static void *producer_main(void *arg)
             break;
         }
 
-        if (!ended) {
+        if (changed_track) {
+            reset_buffer(player);
             continue;
         }
 
-        if (!is_shutdown(player)) {
-            playlist_next(player->playlist);
-        }
+        if (ended) {
 
-        reset_buffer(player);
+            reset_buffer(player);
+
+            size_t total =
+                playlist_count(player->playlist);
+
+            if (total > 1) {
+
+                playlist_next(
+                    player->playlist
+                );
+
+                continue;
+            }
+
+            set_state(
+                player,
+                PLAYER_PAUSED
+            );
+
+            fprintf(
+                stderr,
+                "[Producer] Fin de la canción.\n"
+            );
+        }
     }
 
     buffer_close(&player->buffer);
@@ -242,6 +383,7 @@ static void *producer_main(void *arg)
 static void *consumer_main(void *arg)
 {
     Player *player = arg;
+
     unsigned char data[IO_CHUNK];
 
     snd_pcm_t *pcm = NULL;
@@ -249,53 +391,71 @@ static void *consumer_main(void *arg)
     uint32_t opened_rate = 0;
     uint16_t opened_channels = 0;
 
+    int audio_disabled = 0;
+
     while (!is_shutdown(player)) {
+
         if (!wait_until_playing(player)) {
             break;
         }
 
-        if (!pcm ||
-            opened_rate != player->sample_rate ||
-            opened_channels != player->channels) {
+        uint32_t sample_rate;
+        uint16_t channels;
+        uint16_t bits;
 
+        get_audio_info(
+            player,
+            &sample_rate,
+            &channels,
+            &bits
+        );
+
+        (void)bits;
+
+        if (
+            sample_rate == 0 ||
+            channels == 0
+        ) {
+            sleep_ms(50);
+            continue;
+        }
+
+        if (
+            opened_rate != sample_rate ||
+            opened_channels != channels
+        ) {
             close_alsa(&pcm);
 
-            if (player->sample_rate == 0 ||
-                player->channels == 0) {
+            opened_rate = sample_rate;
+            opened_channels = channels;
 
-                sleep_ms(100);
-                continue;
-            }
+            audio_disabled = 0;
+        }
+
+        if (!pcm && !audio_disabled) {
 
             if (open_alsa(
                     &pcm,
-                    player->channels,
-                    player->sample_rate
+                    channels,
+                    sample_rate
                 ) != 0) {
 
-                fprintf(stderr,
-                        "[Consumer] Se continuará sin salida de audio.\n");
-
-                size_t n = buffer_read(
-                    &player->buffer,
-                    data,
-                    sizeof(data)
+                fprintf(
+                    stderr,
+                    "[Consumer] ALSA no disponible. "
+                    "Se continuará procesando el buffer.\n"
                 );
 
-                if (n == 0) {
-                    sleep_ms(50);
-                }
+                audio_disabled = 1;
+            } else {
 
-                continue;
-            }
-
-            opened_rate = player->sample_rate;
-            opened_channels = player->channels;
-
-            fprintf(stderr,
+                fprintf(
+                    stderr,
                     "[Consumer] ALSA listo: %u Hz, %u canales\n",
-                    opened_rate,
-                    opened_channels);
+                    sample_rate,
+                    channels
+                );
+            }
         }
 
         size_t n = buffer_read(
@@ -309,9 +469,22 @@ static void *consumer_main(void *arg)
             continue;
         }
 
+        /*
+         * Si ALSA no está disponible, los datos
+         * igualmente fueron procesados por el
+         * consumidor. Esto permite ejecutar el
+         * proyecto en WSL sin tarjeta de sonido.
+         */
+        if (!pcm) {
+            continue;
+        }
+
+        size_t bytes_per_frame =
+            channels * sizeof(int16_t);
+
         snd_pcm_sframes_t frames =
             (snd_pcm_sframes_t)(
-                n / (player->channels * sizeof(int16_t))
+                n / bytes_per_frame
             );
 
         if (frames <= 0) {
@@ -320,14 +493,19 @@ static void *consumer_main(void *arg)
 
         snd_pcm_sframes_t offset = 0;
 
-        while (offset < frames && !is_shutdown(player)) {
-            snd_pcm_sframes_t rc = snd_pcm_writei(
-                pcm,
-                data + offset *
-                    player->channels *
-                    sizeof(int16_t),
-                frames - offset
-            );
+        while (
+            offset < frames &&
+            !is_shutdown(player)
+        ) {
+
+            snd_pcm_sframes_t rc =
+                snd_pcm_writei(
+                    pcm,
+                    data +
+                        offset *
+                        bytes_per_frame,
+                    frames - offset
+                );
 
             if (rc == -EPIPE) {
                 snd_pcm_prepare(pcm);
@@ -335,11 +513,16 @@ static void *consumer_main(void *arg)
             }
 
             if (rc < 0) {
-                fprintf(stderr,
-                        "[ALSA] Error de reproducción: %s\n",
-                        snd_strerror((int)rc));
 
-                snd_pcm_prepare(pcm);
+                fprintf(
+                    stderr,
+                    "[ALSA] Error de reproducción: %s\n",
+                    snd_strerror((int)rc)
+                );
+
+                close_alsa(&pcm);
+                audio_disabled = 1;
+
                 break;
             }
 
@@ -352,29 +535,57 @@ static void *consumer_main(void *arg)
     return NULL;
 }
 
-int player_init(Player *player, Playlist *playlist)
+int player_init(
+    Player *player,
+    Playlist *playlist
+)
 {
     if (!player || !playlist) {
         return -1;
     }
 
-    memset(player, 0, sizeof(*player));
+    memset(
+        player,
+        0,
+        sizeof(*player)
+    );
 
     player->playlist = playlist;
     player->state = PLAYER_STOPPED;
 
-    if (buffer_init(&player->buffer, BUFFER_CAPACITY) != 0) {
+    if (
+        buffer_init(
+            &player->buffer,
+            BUFFER_CAPACITY
+        ) != 0
+    ) {
         return -1;
     }
 
-    if (pthread_mutex_init(&player->control_mutex, NULL) != 0) {
+    if (
+        pthread_mutex_init(
+            &player->control_mutex,
+            NULL
+        ) != 0
+    ) {
         buffer_destroy(&player->buffer);
         return -1;
     }
 
-    if (pthread_cond_init(&player->control_cond, NULL) != 0) {
-        pthread_mutex_destroy(&player->control_mutex);
-        buffer_destroy(&player->buffer);
+    if (
+        pthread_cond_init(
+            &player->control_cond,
+            NULL
+        ) != 0
+    ) {
+        pthread_mutex_destroy(
+            &player->control_mutex
+        );
+
+        buffer_destroy(
+            &player->buffer
+        );
+
         return -1;
     }
 
@@ -387,31 +598,48 @@ int player_start(Player *player)
         return -1;
     }
 
-    if (pthread_create(
+    if (
+        pthread_create(
             &player->producer_thread,
             NULL,
             producer_main,
             player
-        ) != 0) {
+        ) != 0
+    ) {
         return -1;
     }
 
-    if (pthread_create(
+    if (
+        pthread_create(
             &player->consumer_thread,
             NULL,
             consumer_main,
             player
-        ) != 0) {
+        ) != 0
+    ) {
 
-        pthread_mutex_lock(&player->control_mutex);
+        pthread_mutex_lock(
+            &player->control_mutex
+        );
 
         player->shutdown = 1;
 
-        pthread_cond_broadcast(&player->control_cond);
+        pthread_cond_broadcast(
+            &player->control_cond
+        );
 
-        pthread_mutex_unlock(&player->control_mutex);
+        pthread_mutex_unlock(
+            &player->control_mutex
+        );
 
-        pthread_join(player->producer_thread, NULL);
+        buffer_close(
+            &player->buffer
+        );
+
+        pthread_join(
+            player->producer_thread,
+            NULL
+        );
 
         return -1;
     }
@@ -425,24 +653,46 @@ void player_destroy(Player *player)
         return;
     }
 
-    pthread_mutex_lock(&player->control_mutex);
+    pthread_mutex_lock(
+        &player->control_mutex
+    );
 
     player->shutdown = 1;
     player->state = PLAYER_STOPPED;
 
-    pthread_cond_broadcast(&player->control_cond);
+    pthread_cond_broadcast(
+        &player->control_cond
+    );
 
-    pthread_mutex_unlock(&player->control_mutex);
+    pthread_mutex_unlock(
+        &player->control_mutex
+    );
 
-    buffer_close(&player->buffer);
+    buffer_close(
+        &player->buffer
+    );
 
-    pthread_join(player->producer_thread, NULL);
-    pthread_join(player->consumer_thread, NULL);
+    pthread_join(
+        player->producer_thread,
+        NULL
+    );
 
-    pthread_cond_destroy(&player->control_cond);
-    pthread_mutex_destroy(&player->control_mutex);
+    pthread_join(
+        player->consumer_thread,
+        NULL
+    );
 
-    buffer_destroy(&player->buffer);
+    pthread_cond_destroy(
+        &player->control_cond
+    );
+
+    pthread_mutex_destroy(
+        &player->control_mutex
+    );
+
+    buffer_destroy(
+        &player->buffer
+    );
 }
 
 void player_play(Player *player)
@@ -451,9 +701,15 @@ void player_play(Player *player)
         return;
     }
 
-    set_state(player, PLAYER_PLAYING);
+    set_state(
+        player,
+        PLAYER_PLAYING
+    );
 
-    fprintf(stderr, "[Control] PLAY\n");
+    fprintf(
+        stderr,
+        "[Control] PLAY\n"
+    );
 }
 
 void player_pause(Player *player)
@@ -462,9 +718,15 @@ void player_pause(Player *player)
         return;
     }
 
-    set_state(player, PLAYER_PAUSED);
+    set_state(
+        player,
+        PLAYER_PAUSED
+    );
 
-    fprintf(stderr, "[Control] PAUSE\n");
+    fprintf(
+        stderr,
+        "[Control] PAUSE\n"
+    );
 }
 
 void player_stop(Player *player)
@@ -473,19 +735,28 @@ void player_stop(Player *player)
         return;
     }
 
-    pthread_mutex_lock(&player->control_mutex);
+    pthread_mutex_lock(
+        &player->control_mutex
+    );
 
     player->state = PLAYER_STOPPED;
     player->skip_requested = 0;
     player->previous_requested = 0;
 
-    pthread_cond_broadcast(&player->control_cond);
+    pthread_cond_broadcast(
+        &player->control_cond
+    );
 
-    pthread_mutex_unlock(&player->control_mutex);
+    pthread_mutex_unlock(
+        &player->control_mutex
+    );
 
     reset_buffer(player);
 
-    fprintf(stderr, "[Control] STOP\n");
+    fprintf(
+        stderr,
+        "[Control] STOP\n"
+    );
 }
 
 void player_next(Player *player)
@@ -494,15 +765,24 @@ void player_next(Player *player)
         return;
     }
 
-    pthread_mutex_lock(&player->control_mutex);
+    pthread_mutex_lock(
+        &player->control_mutex
+    );
 
     player->skip_requested = 1;
 
-    pthread_cond_broadcast(&player->control_cond);
+    pthread_cond_broadcast(
+        &player->control_cond
+    );
 
-    pthread_mutex_unlock(&player->control_mutex);
+    pthread_mutex_unlock(
+        &player->control_mutex
+    );
 
-    fprintf(stderr, "[Control] NEXT solicitado\n");
+    fprintf(
+        stderr,
+        "[Control] NEXT solicitado\n"
+    );
 }
 
 void player_previous(Player *player)
@@ -511,15 +791,24 @@ void player_previous(Player *player)
         return;
     }
 
-    pthread_mutex_lock(&player->control_mutex);
+    pthread_mutex_lock(
+        &player->control_mutex
+    );
 
     player->previous_requested = 1;
 
-    pthread_cond_broadcast(&player->control_cond);
+    pthread_cond_broadcast(
+        &player->control_cond
+    );
 
-    pthread_mutex_unlock(&player->control_mutex);
+    pthread_mutex_unlock(
+        &player->control_mutex
+    );
 
-    fprintf(stderr, "[Control] PREVIOUS solicitado\n");
+    fprintf(
+        stderr,
+        "[Control] PREVIOUS solicitado\n"
+    );
 }
 
 void player_status(Player *player)
@@ -528,29 +817,64 @@ void player_status(Player *player)
         return;
     }
 
-    pthread_mutex_lock(&player->control_mutex);
+    pthread_mutex_lock(
+        &player->control_mutex
+    );
 
     PlayerState state = player->state;
 
-    pthread_mutex_unlock(&player->control_mutex);
+    char current_path[MAX_PATH];
+
+    snprintf(
+        current_path,
+        MAX_PATH,
+        "%s",
+        player->current_path
+    );
+
+    uint32_t sample_rate =
+        player->sample_rate;
+
+    uint16_t channels =
+        player->channels;
+
+    uint16_t bits =
+        player->bits_per_sample;
+
+    pthread_mutex_unlock(
+        &player->control_mutex
+    );
 
     const char *name =
-        state == PLAYER_PLAYING ? "PLAYING" :
-        state == PLAYER_PAUSED ? "PAUSED" :
-        "STOPPED";
+        state == PLAYER_PLAYING
+            ? "PLAYING"
+            : state == PLAYER_PAUSED
+                ? "PAUSED"
+                : "STOPPED";
 
     printf("\n[STATUS]\n");
-    printf("Estado: %s\n", name);
-    printf("Canción: %s\n",
-           player->current_path[0]
-               ? player->current_path
-               : "(ninguna)");
 
-    printf("Buffer: %zu bytes\n",
-           buffer_size(&player->buffer));
+    printf(
+        "Estado: %s\n",
+        name
+    );
 
-    printf("Audio: %u Hz | %u canales | %u bits\n",
-           player->sample_rate,
-           player->channels,
-           player->bits_per_sample);
+    printf(
+        "Canción: %s\n",
+        current_path[0]
+            ? current_path
+            : "(ninguna)"
+    );
+
+    printf(
+        "Buffer: %zu bytes\n",
+        buffer_size(&player->buffer)
+    );
+
+    printf(
+        "Audio: %u Hz | %u canales | %u bits\n",
+        sample_rate,
+        channels,
+        bits
+    );
 }
